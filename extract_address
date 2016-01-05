@@ -1,0 +1,295 @@
+#!/bin/bash
+#
+# Script to extract and search for required address for perf_event exploit
+#
+# Support 32-bit and 64-bit BOOT.IMG
+#
+# Usage:
+#  extract_address boot.img
+#
+# Output:
+#  kallsyms.txt
+#
+
+#cd `dirname $0`
+
+function check_boot {
+
+    boot_size=`ls -l $1 | awk '{ print $5 }'`
+#    echo "boot_size is $boot_size"
+    if [ $boot_size -gt $[ 3*1024*1024 ] ] && [ $boot_size -lt $[ 30*1024*1024 ] ]
+    then
+        ret=`grep -abo ANDROID! $1`
+        if [ $ret ]
+        then
+            return 0
+        else
+            echo "[-] Not a normal boot!"
+            return 1
+        fi
+    else
+        echo "[-] Not a normal boot!"
+        return 1
+    fi
+
+}
+
+function extract_kernel_arm32 {
+
+    # following is only for kernels packed with XZ compression
+    LOC1=`grep-2.10 -P -a -b -m 1 --only-matching '\xfd7zXZ\x00' $1 | tail -1 | cut -d: -f 1`
+    if [ $LOC1 ]
+    then
+        echo "XZ compression detected!"
+        echo "Unpacking zImage!"
+        dd if=$1 bs=$LOC1 skip=1 | xz -dc > kernel.Image
+    else
+        # following is only for kernels packed with LZO compression
+        LOC1=`grep-2.10 -P -a -b --only-matching '\x89LZO\x00' $1 | tail -1 | cut -d: -f 1`
+        if [ $LOC1 ]
+        then
+            echo "LZO compression detected!"
+            echo "Unpacking zImage!"
+            dd if=$1 bs=$LOC1 skip=1 | lzop -do kernel.Image
+        else
+            # following is only for kernels packed with LZ4 compression
+            LOC1=`grep-2.10 -P -a -b --only-matching '\x02\x21\x4c\x18' $1 | tail -1 | cut -d: -f 1`
+            #boot_J5008ZMU1AOF1 use the following LOC1
+            #LOC1=`grep-2.10 -P -a -b -m 1 --only-matching '\x02\x21\x4c\x18' $1 | tail -1 | cut -d: -f 1`
+            if [ $LOC1 ]
+            then
+                echo "LZ4 compression detected!"
+                echo "Unpacking zImage!"
+                dd if=$1 bs=$LOC1 skip=1 | lz4 -d > kernel.Image
+            else
+                # following is only for kernels packed with GZ compression
+                LOC1=`grep-2.10 -P -a -b -m 1 --only-matching '\x1f\x8b\x08' $1 | tail -1 | cut -d: -f 1`
+                #LOC1=`grep-2.10 -P -a -b -m 1 --only-matching '\x1f\x9e' $1 | tail -1 | cut -d: -f 1`
+                #GZ_TAG_NUM=`grep-2.10 -P -a -b --only-matching '\x1f\x8b\x08' $1 | wc -l`
+                #print $GZ_TAG_NUM
+                if [ $LOC1 ]
+                then
+                    echo "GZ compression detected!"
+                    echo "Unpacking zImage!"
+                    #dd if=$1 bs=$LOC1 skip=1 | gzip -dc > kernel.Image
+                    dd if=$1 bs=1 skip=$LOC1 | gzip -dc > kernel.Image
+                else
+                    echo "Unsupported compression!"
+                fi
+            fi
+
+        fi
+
+fi
+
+}
+
+function extract_kernel_arm64 {
+
+    bootimg=`basename $1`
+    offset=`grep -abo ANDROID! $bootimg | cut -f 1 -d :`
+    if [ $offset -gt 0 ]
+    then
+        dd if=$bootimg of=bootimg bs=$offset skip=1 2>/dev/null
+        bootimg=bootimg
+    fi
+
+    kernel_addr=0x`od -A n -X -j 12 -N 4 $bootimg | sed 's/ //g' | sed 's/^0*//g'`
+    kernel_size=`od -A n -D -j 8 -N 4 $bootimg | sed 's/ //g'`
+    page_size=`od -A n -D -j 36 -N 4 $bootimg | sed 's/ //g'`
+    base_addr=$((kernel_addr-0x00008000))
+    kernel_offset=$((kernel_addr-base_addr))
+
+    base_addr=`printf "%08x" $base_addr`
+    kernel_offset=`printf "%08x" $kernel_offset`
+
+    base_addr=0x${base_addr:0-8}
+    kernel_offset=0x${kernel_offset:0-8}
+
+    k_count=$(((kernel_size+page_size-1)/page_size))
+    k_offset=1
+
+    #kernel.Image
+    dd if=$bootimg of=kernel_tmp bs=$page_size skip=$k_offset count=$k_count 2>/dev/null
+    dd if=kernel_tmp of=kernel.Image bs=$kernel_size count=1 2>/dev/null
+
+    kernel=kernel.Image
+    [ -s $kernel ] && rm kernel_tmp
+    [ -s $kernel ] && [ $offset -gt 0 ] && rm bootimg
+
+}
+
+function check_kernel {
+
+    kernel_size=`ls -l kernel.Image | awk '{ print $5 }'`
+#    echo "kernel_size is $kernel_size"
+    if [ $kernel_size -gt $[ 5*1024*1024 ] ] && [ $kernel_size -lt $[ 30*1024*1024 ] ]
+    then
+        return 0
+    else
+        echo "[-] Not a normal kernel!"
+        return 2
+    fi
+
+}
+
+function extract_kallsyms {
+
+    ~/Work/android/scripts/my_kallsyms_x64 kernel.Image > kallsyms_x64.txt 2>stderr_x64.txt
+    ~/Work/android/scripts/my_kallsyms_x86 kernel.Image > kallsyms_x86.txt 2>stderr_x86.txt
+    a=`du kallsyms_x64.txt | awk '{print $1}'`
+    b=`du kallsyms_x86.txt | awk '{print $1}'`
+    if [ $a -gt $b ]
+    then
+        echo "64-bit BOOT.IMG detected!"
+        echo "Grabbing addresses!"
+        if [ -e kallsyms_x86.txt ]
+        then
+            rm kallsyms_x86.txt
+        fi
+        if [ -e stderr_x86.txt ]
+        then
+            rm stderr_x86.txt
+        fi
+        if [ -e kallsyms_x64.txt ]
+        then
+            mv kallsyms_x64.txt kallsyms.txt
+        fi
+        if [ -e stderr_x64.txt ]
+        then
+            mv stderr_x64.txt stderr.txt
+        fi
+    else
+        echo "32-bit BOOT.IMG detected!"
+        echo "Grabbing addresses!"
+        if [ -e kallsyms_x64.txt ]
+        then
+            rm kallsyms_x64.txt
+        fi
+        if [ -e stderr_x64.txt ]
+        then
+            rm stderr_x64.txt
+        fi
+        if [ -e kallsyms_x86.txt ]
+        then
+            mv kallsyms_x86.txt kallsyms.txt
+        fi
+        if [ -e stderr_x86.txt ]
+        then
+            mv stderr_x86.txt stderr.txt
+        fi
+    fi
+
+}
+
+function fix_lz4_tag_select_error {
+
+    echo "LZ4_TAG select error.Reselect now! "
+    LZ4_TAG_NUM=`grep-2.10 -P -a -b --only-matching '\x02\x21\x4c\x18' $1 | wc -l`
+    #echo $LZ4_TAG_NUM
+    for (( i = 1; i < $LZ4_TAG_NUM; i++))
+    do
+        LOC1=`grep-2.10 -P -a -b -m $i --only-matching '\x02\x21\x4c\x18' $1 | tail -1 | cut -d: -f 1`
+        if [ $LOC1 ]
+        then
+            dd if=$1 bs=$LOC1 skip=1 | lz4 -d > kernel.Image
+        fi
+        if [ -e kernel.Image ]
+        then
+            kernel=kernel.Image
+            LOC_ARM64=`grep-2.10 -P -a -b -m 1 --only-matching '\x41\x52\x4d\x64' $kernel | tail -1 | cut -d: -f 1`
+            if [ $LOC_ARM64 ]
+            then
+                ~/Work/android/scripts/my_kallsyms_x64 kernel.Image > kallsyms.txt 2>stderr.txt
+            else
+                ~/Work/android/scripts/my_kallsyms_x86 kernel.Image > kallsyms.txt 2>stderr.txt
+            fi
+        else
+            echo "ERROR! unpacking zImage!"
+        fi
+        if [ -s stderr.txt ]
+        then
+            continue
+        else
+            break
+        fi
+    done
+
+}
+
+function check_kallsyms {
+
+    kallsyms_size=`ls -l kallsyms.txt | awk '{ print $5 }'`
+#    echo "kallsyms_size is $kallsyms_size"
+    if [ $kallsyms_size -gt 50000 ]
+    then
+        if grep -q '\<printk\>' kallsyms.txt
+        then
+            return 0
+        else
+            echo "[-] Not a normal kallsyms!"
+            return 3
+        fi
+    else
+        echo "[-] Not a normal kallsyms!"
+        return 3
+    fi
+
+}
+
+function main {
+
+    check_boot $1
+    ret=$?
+    if [ $ret -ne 0 ]
+    then
+        return $ret
+    fi
+
+    LOC_ARM64=`grep-2.10 -P -a -b -m 1 --only-matching '\x41\x52\x4d\x64' $1 | tail -1 | cut -d: -f 1`
+    if [ $LOC_ARM64 ]
+    then
+        extract_kernel_arm64 $1
+    else
+        extract_kernel_arm32 $1
+    fi
+
+    if [ -e kernel.Image ]
+    then
+        check_kernel
+        ret=$?
+        if [ $ret -ne 0 ]
+        then
+            return $ret
+        fi
+    else
+        return 2
+    fi
+
+    extract_kallsyms
+
+    if [ -s stderr.txt ]
+    then
+        fix_lz4_tag_select_error $1
+    fi
+
+    if [ -e stderr.txt ]
+    then
+        rm stderr.txt
+    fi
+
+    if [ -s kallsyms.txt ]
+    then
+        check_kallsyms
+        ret=$?
+        if [ $ret -ne 0 ]
+        then
+            return $ret
+        fi
+    else
+        return 3
+    fi
+
+}
+
+main $1
